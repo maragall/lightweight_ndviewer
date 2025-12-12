@@ -4,8 +4,10 @@ minimal ndv-based viewer for viewing 5-D acquisitions
 
 ## Setup
 
+Setup:
 ```bash
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate ndviewer_light
 ```
 
 ## Usage
