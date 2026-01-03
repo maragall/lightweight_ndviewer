@@ -50,7 +50,9 @@ _FONT_5X7: dict[str, list[str]] = {
 }
 
 
-def _draw_text(img: np.ndarray, text: str, x: int, y: int, scale: int, value: int) -> None:
+def _draw_text(
+    img: np.ndarray, text: str, x: int, y: int, scale: int, value: int
+) -> None:
     """
     Draw text into a uint16 image in-place using the bitmap font above.
     Text is clipped if it goes out of bounds.
@@ -118,7 +120,12 @@ def main() -> int:
         default=None,
         help="Output dataset folder (default: ~/Downloads/ndv_live_test_<timestamp>).",
     )
-    ap.add_argument("--interval", type=float, default=0.5, help="Seconds between writes (default: 0.5).")
+    ap.add_argument(
+        "--interval",
+        type=float,
+        default=0.5,
+        help="Seconds between writes (default: 0.5).",
+    )
     ap.add_argument("--n-fov", type=int, default=20)
     ap.add_argument("--n-ch", type=int, default=3)
     ap.add_argument("--n-t", type=int, default=25)
@@ -153,13 +160,20 @@ def main() -> int:
     root.mkdir(parents=True, exist_ok=True)
 
     if len(args.channels) != args.n_ch:
-        print(f"Error: --channels length ({len(args.channels)}) must match --n-ch ({args.n_ch}).", file=sys.stderr)
+        print(
+            f"Error: --channels length ({len(args.channels)}) must match --n-ch ({args.n_ch}).",
+            file=sys.stderr,
+        )
         return 2
 
     # Launch viewer as a separate process so we can keep writing.
     viewer_proc = None
     if not args.no_launch:
-        viewer_cmd = [sys.executable, str(Path(__file__).parent / "ndviewer_light.py"), str(root)]
+        viewer_cmd = [
+            sys.executable,
+            str(Path(__file__).parent / "ndviewer_light.py"),
+            str(root),
+        ]
         print("Launching viewer:", " ".join(viewer_cmd))
         viewer_proc = subprocess.Popen(viewer_cmd)
 
@@ -169,10 +183,12 @@ def main() -> int:
     # Precompute a base ramp once (fast to derive planes from it).
     y = np.arange(args.height, dtype=np.uint16)[:, None]
     x = np.arange(args.width, dtype=np.uint16)[None, :]
-    base = (y + x)  # uint16 wrap is fine
+    base = y + x  # uint16 wrap is fine
 
     print(f"Writing dataset to: {root}")
-    print(f"Plan: n_fov={args.n_fov}, n_ch={args.n_ch}, n_t={args.n_t}, size={args.height}x{args.width}")
+    print(
+        f"Plan: n_fov={args.n_fov}, n_ch={args.n_ch}, n_t={args.n_t}, size={args.height}x{args.width}"
+    )
     print(f"Tick interval: {args.interval}s")
 
     # Phase 1: simulate "incomplete acquisition" where FOVs appear gradually in timepoint 0.
@@ -220,5 +236,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
