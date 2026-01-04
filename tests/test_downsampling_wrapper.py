@@ -5,6 +5,9 @@ Tests verify that the custom DataWrapper correctly:
 - Preserves full resolution for 2D slices
 - Handles multichannel data correctly
 - Leaves small volumes unchanged
+
+Note: These tests require NDV to be available. They are skipped in CI
+environments where NDV is not installed.
 """
 
 import numpy as np
@@ -13,20 +16,6 @@ import xarray as xr
 
 # Import from ndviewer_light to register the wrapper (side effect of import)
 from ndviewer_light import MAX_3D_TEXTURE_SIZE
-
-# Check if the wrapper is available (requires scipy and ndv)
-try:
-    from ndv.models._data_wrapper import _recurse_subclasses, DataWrapper
-
-    wrappers = [w.__name__ for w in _recurse_subclasses(DataWrapper)]
-    WRAPPER_AVAILABLE = "Downsampling3DXarrayWrapper" in wrappers
-except ImportError:
-    WRAPPER_AVAILABLE = False
-
-pytestmark = pytest.mark.skipif(
-    not WRAPPER_AVAILABLE,
-    reason="Downsampling3DXarrayWrapper not available (requires scipy and ndv)",
-)
 
 
 @pytest.fixture
@@ -291,3 +280,34 @@ class TestDownsampling3DXarrayWrapper:
         assert max(result.shape[-2:]) <= MAX_3D_TEXTURE_SIZE  # y, x downsampled
         # z is also scaled (it's a spatial dimension)
         assert result.shape[0] <= n_z
+
+    def test_pixel_sizes_in_attrs_preserved(self, data_wrapper_class):
+        """Test that pixel size attrs are preserved through the wrapper.
+
+        Physical pixel sizes (pixel_size_um, dz_um) are stored in attrs for
+        reference and do not affect the numerical downsampling, which operates
+        in index space; voxel scaling for display is handled separately via
+        the vispy VolumeVisual patch in ndviewer_light.py.
+        """
+        large_size = MAX_3D_TEXTURE_SIZE + 500
+        n_z = 50
+        pixel_size_xy = 0.325  # µm per XY pixel
+        pixel_size_z = 1.5  # µm per Z step
+
+        data = xr.DataArray(
+            np.random.randint(0, 65536, (n_z, large_size, large_size), dtype=np.uint16),
+            dims=["z", "y", "x"],
+            attrs={"pixel_size_um": pixel_size_xy, "dz_um": pixel_size_z},
+        )
+        wrapper = data_wrapper_class.create(data)
+
+        # Verify attrs are accessible
+        assert wrapper._data.attrs.get("pixel_size_um") == pixel_size_xy
+        assert wrapper._data.attrs.get("dz_um") == pixel_size_z
+
+        # Request full 3D volume
+        result = wrapper.isel({0: slice(None), 1: slice(None), 2: slice(None)})
+
+        # XY should be downsampled, Z unchanged (independent scaling)
+        assert max(result.shape[-2:]) <= MAX_3D_TEXTURE_SIZE
+        assert result.shape[0] == n_z  # Z not modified since under limit

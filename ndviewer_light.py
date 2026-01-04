@@ -5,11 +5,12 @@ Supports: OME-TIFF and single-TIFF acquisitions with lazy loading via dask.
 Lazy loading enables fast initial display by only reading image planes on-demand.
 """
 
+import json
 import logging
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 
 import numpy as np
@@ -35,6 +36,9 @@ TIFF_EXTENSIONS = {".tif", ".tiff"}
 LIVE_REFRESH_INTERVAL_MS = 750
 
 logger = logging.getLogger(__name__)
+
+# Module-level variable for voxel scale (used by monkey-patched add_volume)
+_current_voxel_scale: Optional[Tuple[float, float, float]] = None
 
 # NDV viewer
 try:
@@ -63,6 +67,117 @@ try:
             QLabeledSlider._ndv_range_patch = True
     except ImportError:
         pass  # superqt not available
+
+    # Monkeypatch vispy VolumeVisual to support anisotropic voxels
+    # This allows correct 3D rendering when Z step differs from XY pixel size
+    try:
+        from ndv.views._vispy._array_canvas import VispyArrayCanvas
+        from vispy.visuals.volume import VolumeVisual
+
+        if not getattr(VolumeVisual, "_voxel_scale_patch", False):
+            _orig_init = VolumeVisual.__init__
+            _orig_create_vertex_data = VolumeVisual._create_vertex_data
+
+            def _patched_init(self, *args, **kwargs):
+                """Initialize VolumeVisual and capture the current voxel scale.
+
+                Storing the scale as an instance attribute ensures thread safety
+                when multiple volumes are created concurrently - each volume
+                captures the scale that was active at its construction time.
+                """
+                _orig_init(self, *args, **kwargs)
+                # Capture the voxel scale active at construction time
+                global _current_voxel_scale
+                self._voxel_scale = _current_voxel_scale
+
+            VolumeVisual.__init__ = _patched_init
+
+            def _patched_create_vertex_data(self):
+                """Create vertices with Z scaling for anisotropic voxels.
+
+                Uses the instance's _voxel_scale attribute (set at construction)
+                rather than the global to ensure correct scaling even when
+                multiple volumes exist with different scales.
+
+                Falls back to original implementation when no scale is set.
+                """
+                # If no scale set, use original implementation
+                scale = getattr(self, "_voxel_scale", None)
+                if scale is None:
+                    return _orig_create_vertex_data(self)
+
+                shape = self._vol_shape
+
+                # Get corner coordinates with Z scaling
+                x0, x1 = -0.5, shape[2] - 0.5
+                y0, y1 = -0.5, shape[1] - 0.5
+
+                # Apply Z scale from instance attribute
+                sz = scale[2]
+                z0, z1 = -0.5 * sz, (shape[0] - 0.5) * sz
+
+                pos = np.array(
+                    [
+                        [x0, y0, z0],
+                        [x1, y0, z0],
+                        [x0, y1, z0],
+                        [x1, y1, z0],
+                        [x0, y0, z1],
+                        [x1, y0, z1],
+                        [x0, y1, z1],
+                        [x1, y1, z1],
+                    ],
+                    dtype=np.float32,
+                )
+
+                indices = np.array(
+                    [2, 6, 0, 4, 5, 6, 7, 2, 3, 0, 1, 5, 3, 7], dtype=np.uint32
+                )
+
+                self._vertices.set_data(pos)
+                self._index_buffer.set_data(indices)
+
+            VolumeVisual._create_vertex_data = _patched_create_vertex_data
+            VolumeVisual._voxel_scale_patch = True
+            logger.info("Voxel scale patch applied to VolumeVisual")
+
+        # Also patch add_volume to update camera range
+        if not getattr(VispyArrayCanvas, "_camera_scale_patch", False):
+            _orig_add_volume = VispyArrayCanvas.add_volume
+
+            def _patched_add_volume(self, data=None):
+                global _current_voxel_scale
+                handle = _orig_add_volume(self, data)
+                # Update camera to account for scaled Z dimension
+                if _current_voxel_scale is not None and data is not None:
+                    # Ensure data has at least 3 dimensions
+                    shape = getattr(data, "shape", None)
+                    if shape is None or len(shape) < 3:
+                        return handle
+                    try:
+                        sz = _current_voxel_scale[2]
+                        if abs(sz - 1.0) > 0.01:
+                            z_size = shape[0] * sz
+                            max_size = max(shape[1], shape[2], z_size)
+                            # Add margin to scale_factor for comfortable viewing distance
+                            self._camera.scale_factor = max_size + 6
+                            self._view.camera.set_range(
+                                x=(0, shape[2]),
+                                y=(0, shape[1]),
+                                z=(0, z_size),
+                                margin=0.01,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to adjust camera for anisotropic voxels: %s", e
+                        )
+                return handle
+
+            VispyArrayCanvas.add_volume = _patched_add_volume
+            VispyArrayCanvas._camera_scale_patch = True
+    except ImportError:
+        pass  # vispy not available
+
 except ImportError:
     NDV_AVAILABLE = False
 
@@ -155,8 +270,9 @@ if NDV_AVAILABLE and LAZY_LOADING_AVAILABLE:
             within OpenGL texture limits.
 
             Downsampling strategy:
-            - z: scaled independently only if z exceeds the texture limit
-            - x/y: scaled uniformly (same factor) to preserve aspect ratio
+            - If physical pixel sizes are known (pixel_size_um, dz_um in attrs),
+              scale to maintain correct physical aspect ratio
+            - Otherwise: z scaled independently, x/y scaled uniformly
             - channel/time/fov: never scaled
             """
             # Get the data using parent's implementation
@@ -183,10 +299,6 @@ if NDV_AVAILABLE and LAZY_LOADING_AVAILABLE:
             # Check if any spatial dimension exceeds the texture limit
             max_texture_size = self._get_max_texture_size()
 
-            # Build per-dimension scale factors (only for dimensions in output data)
-            # - z: scaled independently (if it exceeds limit)
-            # - x/y: use same scale factor to preserve aspect ratio
-
             # First pass: find dimensions and their sizes in output data
             dim_info = []  # [(dim_name, size), ...]
             for i, dim in enumerate(dims):
@@ -195,27 +307,10 @@ if NDV_AVAILABLE and LAZY_LOADING_AVAILABLE:
                     continue  # Dropped dimension
                 dim_info.append((str(dim).lower(), data.shape[len(dim_info)]))
 
-            # Calculate xy scale factor (uniform for x and y to preserve aspect ratio)
-            xy_sizes = [size for name, size in dim_info if name in {"y", "x"}]
-            xy_max = max(xy_sizes) if xy_sizes else 0
-            xy_scale = max_texture_size / xy_max if xy_max > max_texture_size else 1.0
-
-            # Build zoom factors
-            zoom_factors = []
-            needs_downsampling = False
-            for dim_name, dim_size in dim_info:
-                if dim_name in {"y", "x"}:
-                    # Use uniform xy scale to preserve aspect ratio
-                    zoom_factors.append(xy_scale)
-                    if xy_scale < 1.0:
-                        needs_downsampling = True
-                elif dim_name in spatial_z_names and dim_size > max_texture_size:
-                    # z scaled independently
-                    z_scale = max_texture_size / dim_size
-                    zoom_factors.append(z_scale)
-                    needs_downsampling = True
-                else:
-                    zoom_factors.append(1.0)
+            # Compute zoom factors for downsampling
+            zoom_factors, needs_downsampling = self._compute_simple_zoom_factors(
+                dim_info, max_texture_size, spatial_z_names
+            )
 
             if needs_downsampling:
                 logger.info(
@@ -232,6 +327,41 @@ if NDV_AVAILABLE and LAZY_LOADING_AVAILABLE:
                     return data
 
             return data
+
+        def _compute_simple_zoom_factors(
+            self, dim_info: list, max_texture_size: int, spatial_z_names: set
+        ) -> tuple:
+            """Compute zoom factors for 3D volume downsampling.
+
+            Strategy:
+            - XY: scaled uniformly (same factor for X and Y) to preserve XY aspect ratio
+            - Z: scaled independently only if it exceeds the texture limit
+            - Non-spatial dims (channel, time, fov): never scaled
+
+            Note: Physical aspect ratio correction is handled via vertex scaling
+            in the vispy VolumeVisual patch.
+            """
+            # Calculate xy scale factor (uniform for x and y to preserve XY aspect)
+            xy_sizes = [size for name, size in dim_info if name in {"y", "x"}]
+            xy_max = max(xy_sizes) if xy_sizes else 0
+            xy_scale = max_texture_size / xy_max if xy_max > max_texture_size else 1.0
+
+            # Build zoom factors
+            zoom_factors = []
+            needs_downsampling = False
+            for dim_name, dim_size in dim_info:
+                if dim_name in {"y", "x"}:
+                    zoom_factors.append(xy_scale)
+                    if xy_scale < 1.0:
+                        needs_downsampling = True
+                elif dim_name in spatial_z_names and dim_size > max_texture_size:
+                    z_scale = max_texture_size / dim_size
+                    zoom_factors.append(z_scale)
+                    needs_downsampling = True
+                else:
+                    zoom_factors.append(1.0)
+
+            return zoom_factors, needs_downsampling
 
 
 # Filename patterns (from common.py)
@@ -278,6 +408,270 @@ def extract_wavelength(channel_str: str):
         # Prefer the last 3-4 digit group (likely wavelength)
         val = int(numbers[-1])
         return val if val > 0 else None
+    return None
+
+
+def extract_ome_physical_sizes(
+    ome_metadata: str,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Extract physical pixel sizes from OME-XML metadata.
+
+    Returns:
+        Tuple of (pixel_size_x_um, pixel_size_y_um, pixel_size_z_um).
+        Values are in micrometers. None if not found or unable to parse.
+    """
+    if not ome_metadata:
+        return None, None, None
+
+    try:
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(ome_metadata)
+        # Try multiple OME namespace versions
+        namespaces = [
+            {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"},
+            {"ome": "http://www.openmicroscopy.org/Schemas/OME/2015-01"},
+            {"ome": "http://www.openmicroscopy.org/Schemas/OME/2013-06"},
+            {},  # No namespace fallback
+        ]
+
+        for ns in namespaces:
+            # Find Pixels element which contains physical size attributes
+            if ns:
+                pixels = root.find(".//ome:Pixels", ns)
+            else:
+                # Try without or with any namespace (.//{*} matches any namespace)
+                pixels = root.find(".//{*}Pixels")
+
+            if pixels is not None:
+                size_x = pixels.get("PhysicalSizeX")
+                size_y = pixels.get("PhysicalSizeY")
+                size_z = pixels.get("PhysicalSizeZ")
+                unit_x = pixels.get("PhysicalSizeXUnit", "µm")
+                unit_y = pixels.get("PhysicalSizeYUnit", "µm")
+                unit_z = pixels.get("PhysicalSizeZUnit", "µm")
+
+                def to_micrometers(value: Optional[str], unit: str) -> Optional[float]:
+                    if value is None:
+                        return None
+                    try:
+                        val = float(value)
+                        # Convert to micrometers based on unit
+                        unit_lower = unit.lower()
+                        if unit_lower in ("nm", "nanometer", "nanometers"):
+                            result = val / 1000.0
+                        elif unit_lower in ("mm", "millimeter", "millimeters"):
+                            result = val * 1000.0
+                        elif unit_lower in ("m", "meter", "meters"):
+                            result = val * 1e6
+                        else:
+                            # Default assumes micrometers (µm, um, micron, etc.)
+                            result = val
+                        # Physical sizes must be strictly positive
+                        if result <= 0:
+                            return None
+                        return result
+                    except (ValueError, TypeError):
+                        return None
+
+                px = to_micrometers(size_x, unit_x)
+                py = to_micrometers(size_y, unit_y)
+                pz = to_micrometers(size_z, unit_z)
+
+                if px is not None or py is not None or pz is not None:
+                    return px, py, pz
+
+    except Exception as e:
+        logger.debug("Failed to extract physical sizes from OME metadata: %s", e)
+
+    return None, None, None
+
+
+def read_acquisition_parameters(
+    base_path: Path,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Read pixel size and dz from acquisition parameters JSON file.
+
+    Supports both "acquisition_parameters.json" and "acquisition parameters.json".
+    Can compute pixel size from sensor_pixel_size_um and objective magnification.
+
+    Returns:
+        Tuple of (pixel_size_um, dz_um). None if not found.
+    """
+    # Try both filename variants
+    params_file = base_path / "acquisition_parameters.json"
+    if not params_file.exists():
+        params_file = base_path / "acquisition parameters.json"
+    if not params_file.exists():
+        return None, None
+
+    try:
+        with open(params_file, "r") as f:
+            params = json.load(f)
+
+        pixel_size = None
+        dz = None
+
+        # Try direct pixel size keys first
+        for key in ["pixel_size_um", "pixel_size", "pixelSize", "pixel_size_xy"]:
+            if key in params:
+                try:
+                    candidate_pixel = float(params[key])
+                except (TypeError, ValueError):
+                    continue
+                # Sanity check: typical microscopy pixel sizes are 0.1-10 µm
+                # Range 0.01-100 µm covers most use cases including low-mag imaging
+                if 0.01 < candidate_pixel <= 100:
+                    pixel_size = candidate_pixel
+                    break
+
+        # If not found, compute from sensor pixel size and magnification
+        # Account for tube lens ratio: actual_mag = nominal_mag × (tube_lens / obj_tube_lens)
+        if pixel_size is None:
+            sensor_pixel = params.get("sensor_pixel_size_um")
+            objective = params.get("objective", {})
+            if isinstance(objective, dict):
+                nominal_mag = objective.get("magnification")
+                obj_tube_lens = objective.get("tube_lens_f_mm")
+            else:
+                nominal_mag = None
+                obj_tube_lens = None
+            tube_lens = params.get("tube_lens_mm")
+
+            if sensor_pixel is not None and nominal_mag is not None and nominal_mag > 0:
+                # Compute actual magnification with tube lens correction
+                if (
+                    tube_lens is not None
+                    and obj_tube_lens is not None
+                    and obj_tube_lens > 0
+                ):
+                    actual_mag = float(nominal_mag) * (
+                        float(tube_lens) / float(obj_tube_lens)
+                    )
+                else:
+                    actual_mag = float(nominal_mag)
+                computed = float(sensor_pixel) / actual_mag
+                # Sanity check: typical microscopy pixel sizes are 0.1-10 µm
+                # Range 0.01-100 µm covers most use cases including low-mag imaging
+                if 0.01 < computed <= 100:
+                    pixel_size = computed
+
+        # Try common key names for z spacing
+        for key in [
+            "dz_um",
+            "dz",
+            "z_step",
+            "zStep",
+            "z_spacing",
+            "pixel_size_z",
+            "dz(um)",
+        ]:
+            if key in params:
+                try:
+                    candidate_dz = float(params[key])
+                except (TypeError, ValueError):
+                    continue
+                # dz must be strictly positive to be physically meaningful
+                if candidate_dz > 0:
+                    dz = candidate_dz
+                    break
+
+        return pixel_size, dz
+
+    except Exception as e:
+        logger.debug("Failed to read acquisition parameters: %s", e)
+        return None, None
+
+
+def read_tiff_pixel_size(tiff_path: str) -> Optional[float]:
+    """Read pixel size from TIFF metadata tags.
+
+    Attempts to extract pixel size from (in priority order):
+    1. ImageDescription tag (JSON metadata from some microscopy software)
+    2. XResolution/YResolution tags with ResolutionUnit
+
+    Note on ResolutionUnit: Only inch (2) and centimeter (3) units are supported.
+    Unit value 1 ("no absolute unit") is explicitly rejected because it cannot
+    be reliably converted to physical units. Many image editors set resolution
+    tags without meaningful physical units, so we require explicit inch/cm units.
+
+    Returns:
+        Pixel size in micrometers, or None if not found.
+    """
+    if not LAZY_LOADING_AVAILABLE:
+        return None
+
+    try:
+        with tf.TiffFile(tiff_path) as tif:
+            page = tif.pages[0]
+
+            # Try ImageDescription tag FIRST for JSON metadata
+            # (more reliable for microscopy data)
+            desc = page.tags.get("ImageDescription")
+            if desc is not None:
+                desc_str = desc.value
+                if isinstance(desc_str, bytes):
+                    desc_str = desc_str.decode("utf-8", errors="ignore")
+
+                # Try to parse as JSON
+                try:
+                    metadata = json.loads(desc_str)
+                    for key in [
+                        "pixel_size_um",
+                        "pixel_size",
+                        "PixelSize",
+                        "pixelSize",
+                    ]:
+                        if key in metadata:
+                            val = float(metadata[key])
+                            # Require strictly positive value
+                            if val <= 0:
+                                continue
+                            # Sanity check: typical microscopy pixel sizes are 0.1-10 µm
+                            # Range 0.01-100 µm covers most use cases including low-mag imaging
+                            if 0.01 < val <= 100:
+                                return val
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    # JSON parsing failed; fall through to resolution tags below
+                    pass
+
+            # Try XResolution/YResolution tags with proper unit
+            x_res = page.tags.get("XResolution")
+            res_unit = page.tags.get("ResolutionUnit")
+
+            # Only use resolution tags if we have a proper unit (inch=2 or cm=3)
+            unit_value = res_unit.value if res_unit else 1
+            if unit_value not in (2, 3):
+                return None  # No unit or unknown unit - can't reliably convert
+
+            if x_res is not None:
+                # XResolution is stored as a fraction (numerator, denominator)
+                x_res_value = x_res.value
+                if isinstance(x_res_value, tuple) and len(x_res_value) == 2:
+                    pixels_per_unit = x_res_value[0] / x_res_value[1]
+                else:
+                    pixels_per_unit = float(x_res_value)
+
+                # Skip default/invalid values (must be > 1 to be meaningful)
+                if pixels_per_unit <= 1:
+                    return None
+
+                # Convert to micrometers based on unit
+                if unit_value == 2:  # inch
+                    # pixels/inch -> um/pixel: 25400 um/inch / pixels_per_inch
+                    pixel_size_um = 25400.0 / pixels_per_unit
+                else:  # centimeter (unit_value == 3)
+                    # pixels/cm -> um/pixel: 10000 um/cm / pixels_per_cm
+                    pixel_size_um = 10000.0 / pixels_per_unit
+
+                # Sanity check: typical microscopy pixel sizes are 0.1-10 µm
+                # Range 0.01-100 µm covers most use cases including low-mag imaging
+                if 0.01 < pixel_size_um <= 100:
+                    return pixel_size_um
+
+    except Exception as e:
+        logger.debug("Failed to read pixel size from TIFF tags: %s", e)
+
     return None
 
 
@@ -774,6 +1168,7 @@ class LightweightViewer(QWidget):
                 height = shape_dict.get("Y", shape[-2])
                 width = shape_dict.get("X", shape[-1])
                 channel_names = []
+                pixel_size_x, pixel_size_y, pixel_size_z = None, None, None
                 try:
                     if tif.ome_metadata:
                         import xml.etree.ElementTree as ET
@@ -786,6 +1181,11 @@ class LightweightViewer(QWidget):
                             name = ch.get("Name") or ch.get("ID", "")
                             if name:
                                 channel_names.append(name)
+
+                        # Extract physical pixel sizes
+                        pixel_size_x, pixel_size_y, pixel_size_z = (
+                            extract_ome_physical_sizes(tif.ome_metadata)
+                        )
                 except Exception as e:
                     logger.debug("Failed to parse OME metadata: %s", e)
 
@@ -862,6 +1262,21 @@ class LightweightViewer(QWidget):
             xarr.attrs["luts"] = luts
             xarr.attrs["channel_names"] = channel_names
             xarr.attrs["_open_tifs"] = tifs_kept
+
+            # Store physical pixel sizes (in micrometers)
+            if pixel_size_x is not None:
+                xarr.attrs["pixel_size_x_um"] = pixel_size_x
+            if pixel_size_y is not None:
+                xarr.attrs["pixel_size_y_um"] = pixel_size_y
+            if pixel_size_z is not None:
+                xarr.attrs["pixel_size_z_um"] = pixel_size_z
+            # Also store commonly used aliases
+            if pixel_size_x is not None and pixel_size_y is not None:
+                # Use average for isotropic XY pixel size
+                xarr.attrs["pixel_size_um"] = (pixel_size_x + pixel_size_y) / 2
+            if pixel_size_z is not None:
+                xarr.attrs["dz_um"] = pixel_size_z
+
             return xarr
         except Exception as e:
             print(f"OME-TIFF load error: {e}")
@@ -974,6 +1389,13 @@ class LightweightViewer(QWidget):
                 _block_loader, dummy, dtype=np.uint16, chunks=chunks
             )
 
+            # Read acquisition parameters for pixel size and dz
+            pixel_size_um, dz_um = read_acquisition_parameters(base_path)
+
+            # Fallback: try reading pixel size from TIFF metadata tags
+            if pixel_size_um is None and sample is not None:
+                pixel_size_um = read_tiff_pixel_size(sample)
+
             xarr = xr.DataArray(
                 stacked,
                 dims=["time", "fov", "z", "channel", "y", "x"],
@@ -988,6 +1410,16 @@ class LightweightViewer(QWidget):
             )
             xarr.attrs["luts"] = luts
             xarr.attrs["channel_names"] = channel_names
+
+            # Store physical pixel sizes (in micrometers)
+            if pixel_size_um is not None:
+                xarr.attrs["pixel_size_um"] = pixel_size_um
+                xarr.attrs["pixel_size_x_um"] = pixel_size_um
+                xarr.attrs["pixel_size_y_um"] = pixel_size_um
+            if dz_um is not None:
+                xarr.attrs["dz_um"] = dz_um
+                xarr.attrs["pixel_size_z_um"] = dz_um
+
             return xarr
         except Exception as e:
             print(f"Single-TIFF load error: {e}")
@@ -998,8 +1430,31 @@ class LightweightViewer(QWidget):
 
     def _set_ndv_data(self, data: xr.DataArray):
         """Update NDV viewer with lazy array."""
+        global _current_voxel_scale
+
         if not NDV_AVAILABLE or not self.ndv_viewer:
             return
+
+        # Log scale information and set voxel scale for 3D rendering
+        pixel_size = data.attrs.get("pixel_size_um")
+        dz = data.attrs.get("dz_um")
+        if pixel_size is not None or dz is not None:
+            scale_info = []
+            if pixel_size is not None:
+                scale_info.append(f"XY pixel size: {pixel_size:.4f} µm")
+            if dz is not None:
+                scale_info.append(f"Z step: {dz:.4f} µm")
+            print(f"Scale metadata: {', '.join(scale_info)}")
+
+            # Set voxel scale for 3D rendering (Z scaled relative to XY)
+            if pixel_size is not None and dz is not None and pixel_size > 0:
+                z_scale = dz / pixel_size
+                _current_voxel_scale = (1.0, 1.0, z_scale)
+                logger.info(f"Voxel aspect ratio (Z/XY): {z_scale:.2f}")
+            else:
+                _current_voxel_scale = None
+        else:
+            _current_voxel_scale = None
 
         luts = data.attrs.get("luts", {})
         channel_axis = data.dims.index("channel") if "channel" in data.dims else None
