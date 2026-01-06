@@ -40,31 +40,27 @@ def data_structure_changed(old_data, new_data) -> bool:
     if old_data is None:
         return True
 
-    try:
-        # Check if dims changed
-        if old_data.dims != new_data.dims:
-            return True
-
-        # Check if channel count changed (use .sizes for cleaner access)
-        if old_data.sizes.get("channel", 0) != new_data.sizes.get("channel", 0):
-            return True
-
-        # Check if channel names changed
-        old_names = old_data.attrs.get("channel_names", [])
-        new_names = new_data.attrs.get("channel_names", [])
-        if old_names != new_names:
-            return True
-
-        # Check if LUTs changed
-        old_luts = old_data.attrs.get("luts", {})
-        new_luts = new_data.attrs.get("luts", {})
-        if old_luts != new_luts:
-            return True
-
-        return False
-    except Exception:
-        # On any error, assume structure changed to be safe
+    # Check if dims changed
+    if old_data.dims != new_data.dims:
         return True
+
+    # Check if channel count changed (use .sizes for cleaner access)
+    if old_data.sizes.get("channel", 0) != new_data.sizes.get("channel", 0):
+        return True
+
+    # Check if channel names changed
+    old_names = old_data.attrs.get("channel_names", [])
+    new_names = new_data.attrs.get("channel_names", [])
+    if old_names != new_names:
+        return True
+
+    # Check if LUTs changed
+    old_luts = old_data.attrs.get("luts", {})
+    new_luts = new_data.attrs.get("luts", {})
+    if old_luts != new_luts:
+        return True
+
+    return False
 
 
 def create_test_xarray(
@@ -207,6 +203,12 @@ class TestDataStructureChanged:
         """When new data has LUTs but old didn't, should return True."""
         old = create_test_xarray(luts=None)
         new = create_test_xarray(luts={0: "blue", 1: "green", 2: "red"})
+        assert data_structure_changed(old, new) is True
+
+    def test_luts_removed_returns_true(self):
+        """When new data lacks LUTs but old had them, should return True."""
+        old = create_test_xarray(luts={0: "blue", 1: "green", 2: "red"})
+        new = create_test_xarray(luts=None)
         assert data_structure_changed(old, new) is True
 
     # --- Tests for spatial dimension changes (should NOT trigger rebuild) ---
