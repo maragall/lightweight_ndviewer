@@ -708,6 +708,59 @@ def wavelength_to_colormap(wavelength: Optional[int]) -> str:
     return "gray"
 
 
+def data_structure_changed(
+    old_data: Optional["xr.DataArray"], new_data: "xr.DataArray"
+) -> bool:
+    """Check if data structure changed significantly (requiring full viewer rebuild).
+
+    This is a module-level utility function that detects changes in dimensions,
+    dtype, channel count, channel names, or LUT configuration that would require
+    rebuilding the NDV viewer rather than just swapping data in-place.
+
+    This function is used by both the LightweightViewer class and unit tests,
+    ensuring a single source of truth for the comparison logic.
+
+    Args:
+        old_data: Previous dataset state. May be ``None`` if no prior dataset
+            exists; when ``None``, the structure is treated as changed.
+        new_data: Newly loaded dataset to compare against ``old_data``.
+
+    Returns:
+        True if structure changed and viewer needs full rebuild.
+
+    Raises:
+        Any exception from xarray attribute access is propagated to the caller.
+    """
+    if old_data is None:
+        return True
+
+    # Check if dims changed
+    if old_data.dims != new_data.dims:
+        return True
+
+    # Check if dtype changed (may need different contrast limits)
+    if old_data.dtype != new_data.dtype:
+        return True
+
+    # Check if channel count changed (use .sizes for cleaner access)
+    if old_data.sizes.get("channel", 0) != new_data.sizes.get("channel", 0):
+        return True
+
+    # Check if channel names changed
+    old_names = old_data.attrs.get("channel_names", [])
+    new_names = new_data.attrs.get("channel_names", [])
+    if old_names != new_names:
+        return True
+
+    # Check if LUTs changed
+    old_luts = old_data.attrs.get("luts", {})
+    new_luts = new_data.attrs.get("luts", {})
+    if old_luts != new_luts:
+        return True
+
+    return False
+
+
 def _apply_dark_theme(widget: QWidget) -> None:
     """Apply dark Fusion theme to a widget."""
     widget.setStyle(QStyleFactory.create("Fusion"))
@@ -1080,43 +1133,18 @@ class LightweightViewer(QWidget):
     ) -> bool:
         """Check if data structure changed significantly (requiring full viewer rebuild).
 
-        This detects changes in dimensions, channel count, channel names, or LUT
-        configuration that would require rebuilding the NDV viewer rather than
-        just swapping data in-place.
+        Delegates to the module-level :func:`data_structure_changed` function,
+        wrapping it with exception handling for safety in the viewer context.
 
         Args:
-            old_data: Previous dataset state. May be ``None`` if no prior dataset
-                exists; when ``None``, the structure is treated as changed.
-            new_data: Newly loaded dataset to compare against ``old_data``.
+            old_data: Previous dataset state (or None for first load).
+            new_data: Newly loaded dataset to compare.
 
         Returns:
             True if structure changed and viewer needs full rebuild.
         """
-        if old_data is None:
-            return True
-
         try:
-            # Check if dims changed
-            if old_data.dims != new_data.dims:
-                return True
-
-            # Check if channel count changed (use .sizes for cleaner access)
-            if old_data.sizes.get("channel", 0) != new_data.sizes.get("channel", 0):
-                return True
-
-            # Check if channel names changed
-            old_names = old_data.attrs.get("channel_names", [])
-            new_names = new_data.attrs.get("channel_names", [])
-            if old_names != new_names:
-                return True
-
-            # Check if LUTs changed
-            old_luts = old_data.attrs.get("luts", {})
-            new_luts = new_data.attrs.get("luts", {})
-            if old_luts != new_luts:
-                return True
-
-            return False
+            return data_structure_changed(old_data, new_data)
         except Exception as e:
             # On any error, assume structure changed to be safe
             logger.debug("Error checking data structure change: %s", e)

@@ -1,12 +1,13 @@
 """
-Unit tests for _data_structure_changed() method in LightweightViewer.
+Unit tests for data_structure_changed() function in ndviewer_light.
 
 Tests cover:
 1. Detection of dimension changes
-2. Detection of channel count changes
-3. Detection of channel name changes
-4. Detection of LUT changes
-5. Edge cases (None old_data, exceptions)
+2. Detection of dtype changes
+3. Detection of channel count changes
+4. Detection of channel name changes
+5. Detection of LUT changes
+6. Edge cases (None old_data, exceptions)
 
 These tests verify the logic that determines when the NDV viewer needs
 a full rebuild vs. an in-place data swap when switching datasets.
@@ -14,58 +15,19 @@ a full rebuild vs. an in-place data swap when switching datasets.
 
 import numpy as np
 import pytest
+from unittest.mock import MagicMock
 
 # Import xarray - required for these tests
 xr = pytest.importorskip("xarray")
 
-
-def data_structure_changed(old_data, new_data) -> bool:
-    """Standalone implementation of the detection logic for testing.
-
-    This mirrors the logic in LightweightViewer._data_structure_changed()
-    so we can test without instantiating the full viewer (which requires Qt).
-
-    NOTE: This duplicates the logic from the actual implementation. If
-    LightweightViewer._data_structure_changed() is modified, this function
-    must be updated to match. When making changes to the detection logic,
-    verify both implementations are in sync to avoid false test confidence.
-
-    Args:
-        old_data: Previous xarray DataArray (or None for first load)
-        new_data: New xarray DataArray
-
-    Returns:
-        True if structure changed and viewer needs full rebuild.
-    """
-    if old_data is None:
-        return True
-
-    # Check if dims changed
-    if old_data.dims != new_data.dims:
-        return True
-
-    # Check if channel count changed (use .sizes for cleaner access)
-    if old_data.sizes.get("channel", 0) != new_data.sizes.get("channel", 0):
-        return True
-
-    # Check if channel names changed
-    old_names = old_data.attrs.get("channel_names", [])
-    new_names = new_data.attrs.get("channel_names", [])
-    if old_names != new_names:
-        return True
-
-    # Check if LUTs changed
-    old_luts = old_data.attrs.get("luts", {})
-    new_luts = new_data.attrs.get("luts", {})
-    if old_luts != new_luts:
-        return True
-
-    return False
+# Import the actual function from ndviewer_light - single source of truth
+from ndviewer_light import data_structure_changed
 
 
 def create_test_xarray(
     dims=("time", "fov", "z", "channel", "y", "x"),
     shape=(1, 1, 1, 3, 100, 100),
+    dtype=np.uint16,
     channel_names=None,
     luts=None,
 ):
@@ -74,13 +36,14 @@ def create_test_xarray(
     Args:
         dims: Tuple of dimension names
         shape: Tuple of dimension sizes (must match dims length)
+        dtype: NumPy dtype for the data array
         channel_names: List of channel names for attrs
         luts: Dict of channel index -> colormap name for attrs
 
     Returns:
         xr.DataArray with the specified structure
     """
-    data = np.zeros(shape, dtype=np.uint16)
+    data = np.zeros(shape, dtype=dtype)
 
     # Build coords dict
     coords = {}
@@ -98,7 +61,7 @@ def create_test_xarray(
 
 
 class TestDataStructureChanged:
-    """Tests for _data_structure_changed() logic.
+    """Tests for data_structure_changed() logic.
 
     These tests verify the detection logic without requiring Qt/NDV.
     We test the comparison logic directly using xarray DataArrays.
@@ -136,6 +99,26 @@ class TestDataStructureChanged:
             dims=("time", "fov", "channel", "z", "y", "x"),  # z and channel swapped
             shape=(1, 1, 3, 1, 100, 100),
         )
+        assert data_structure_changed(old, new) is True
+
+    # --- Tests for dtype changes ---
+
+    def test_different_dtype_returns_true(self):
+        """When dtype differs, should return True (may need different contrast)."""
+        old = create_test_xarray(dtype=np.uint8)
+        new = create_test_xarray(dtype=np.uint16)
+        assert data_structure_changed(old, new) is True
+
+    def test_same_dtype_returns_false(self):
+        """When dtype is identical, should not trigger rebuild for dtype."""
+        old = create_test_xarray(dtype=np.uint16)
+        new = create_test_xarray(dtype=np.uint16)
+        assert data_structure_changed(old, new) is False
+
+    def test_float_to_int_dtype_returns_true(self):
+        """When switching from float to int dtype, should return True."""
+        old = create_test_xarray(dtype=np.float32)
+        new = create_test_xarray(dtype=np.uint16)
         assert data_structure_changed(old, new) is True
 
     # --- Tests for channel count changes ---
@@ -285,7 +268,7 @@ class TestDataStructureChanged:
 
 
 class TestDataStructureChangedEdgeCases:
-    """Edge case tests for _data_structure_changed()."""
+    """Edge case tests for data_structure_changed()."""
 
     def test_empty_channel_names_both_sides(self):
         """When both have empty channel_names, should not trigger rebuild."""
@@ -311,3 +294,20 @@ class TestDataStructureChangedEdgeCases:
         new = create_test_xarray(luts=None)
         # Both should resolve to {} via .get("luts", {})
         assert data_structure_changed(old, new) is False
+
+    def test_exception_propagates_to_caller(self):
+        """When comparison raises exception, it should propagate to caller.
+
+        The module-level function does NOT catch exceptions - that's the
+        responsibility of the caller (e.g., LightweightViewer._data_structure_changed).
+        """
+        # Create a mock that raises on .dims access
+        old = MagicMock()
+        old.dims = property(lambda self: (_ for _ in ()).throw(RuntimeError("test")))
+        # Make dims access raise
+        type(old).dims = property(lambda self: (_ for _ in ()).throw(RuntimeError("test")))
+
+        new = create_test_xarray()
+
+        with pytest.raises(RuntimeError, match="test"):
+            data_structure_changed(old, new)
