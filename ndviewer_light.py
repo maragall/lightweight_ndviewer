@@ -1221,7 +1221,9 @@ class LightweightViewer(QWidget):
                         logger.debug(f"set_current_index (fallback): {dim}={value}")
                         return True
 
-            logger.debug(f"set_current_index: dimension '{dim}' not found or API unavailable")
+            logger.debug(
+                f"set_current_index: dimension '{dim}' not found or API unavailable"
+            )
             return False
         except Exception as e:
             logger.debug(f"set_current_index error: {e}")

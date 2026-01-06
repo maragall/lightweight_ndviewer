@@ -305,7 +305,9 @@ class TestDataStructureChangedEdgeCases:
         old = MagicMock()
         old.dims = property(lambda self: (_ for _ in ()).throw(RuntimeError("test")))
         # Make dims access raise
-        type(old).dims = property(lambda self: (_ for _ in ()).throw(RuntimeError("test")))
+        type(old).dims = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("test"))
+        )
 
         new = create_test_xarray()
 
