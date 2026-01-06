@@ -1095,12 +1095,9 @@ class LightweightViewer(QWidget):
             if old_data.dims != new_data.dims:
                 return True
 
-            # Check if channel count changed
-            if "channel" in old_data.dims and "channel" in new_data.dims:
-                old_channels = old_data.coords.get("channel", [])
-                new_channels = new_data.coords.get("channel", [])
-                if len(old_channels) != len(new_channels):
-                    return True
+            # Check if channel count changed (use .sizes for cleaner access)
+            if old_data.sizes.get("channel", 0) != new_data.sizes.get("channel", 0):
+                return True
 
             # Check if channel names changed
             old_names = old_data.attrs.get("channel_names", [])
